@@ -151,6 +151,24 @@ test('pay record amounts are in batteries (real records reported by a user)', ()
   assert.ok(csv[1].includes(',心动盲盒,1,15,150,'), csv[1]);
 });
 
+test('summary tables export as CSV in yuan and batteries', () => {
+  const s = L.summarize([
+    rec(1, 1696089600, { pay_coin: '150', gift_id: 32251, gift_name: '心动盲盒' }), // 2023-10-01
+    rec(2, 1698768000, { pay_coin: '15980', gift_id: 10003, gift_name: '提督', ruid: 8, r_uname: '主播B' }), // 2023-11-01
+  ]);
+  const lines = (csv) => csv.replace(String.fromCharCode(0xfeff), '').split('\r\n');
+  assert.deepEqual(lines(L.streamersCsv(s.streamers)), [
+    '主播,主播UID,元,电池,笔数,第一次,最近一次',
+    '主播B,8,1598,15980,1,2023-11-01,2023-11-01',
+    '主播A,7,15,150,1,2023-10-01,2023-10-01',
+  ]);
+  assert.deepEqual(lines(L.giftsCsv(s.gifts)), ['礼物,礼物ID,数量,元,电池', '提督,10003,1,1598,15980', '心动盲盒,32251,1,15,150']);
+  assert.deepEqual(lines(L.monthsCsv(s.months)), ['月份,元,电池', '2023-10,15,150', '2023-11,1598,15980']);
+  const onlyB = lines(L.recordsCsv(s.rows.filter((r) => r.ruid === 8)));
+  assert.equal(onlyB.length, 2);
+  assert.ok(onlyB[1].startsWith('2023-11-01 00:00,主播B,8,提督,1,1598,15980,'), onlyB[1]);
+});
+
 test('blindBoxSummary computes profit and flags unknown prices', () => {
   const info = { id: 1, name: '盲盒', priceGold: 15000, gifts: [{ giftId: 11, name: 'A', priceGold: 5000 }, { giftId: 12, name: 'B', priceGold: 60000 }] };
   const s = L.blindBoxSummary(info, [

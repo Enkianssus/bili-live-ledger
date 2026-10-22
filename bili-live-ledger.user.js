@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站直播消费账本
 // @namespace    bili-live-ledger
-// @version      0.1.1
+// @version      0.2.0
 // @description  在 B 站自己的页面里统计你的直播送礼消费：按主播、月份、礼物汇总，可导出。没有服务器，不需要扫码，数据只存在你的浏览器里。
 // @license      MIT
 // @match        https://live.bilibili.com/*
@@ -26,7 +26,7 @@
 (function (root) {
   'use strict';
 
-  const VERSION = '0.1.1';
+  const VERSION = '0.2.0';
 
   const API = {
     nav: 'https://api.bilibili.com/x/web-interface/nav',
@@ -408,12 +408,35 @@
     return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   }
 
+  const csvYuan = (gold) => Math.round(gold / 10) / 100;
+  const csvBattery = (gold) => Math.round(gold) / 100;
+
+  function csvTable(header, rows) {
+    return String.fromCharCode(0xfeff) + [header, ...rows].map((row) => row.map(csvCell).join(',')).join('\r\n');
+  }
+
+  // rows 是 normalize 之后的记录，按传入的顺序输出
+  function recordsCsv(rows) {
+    return csvTable(['时间', '主播', '主播UID', '礼物', '数量', '元', '电池', '来源', '状态', '记录ID'],
+      rows.map((r) => [fmtTime(r.ts), r.rname, r.ruid, r.giftName, r.giftNum, csvYuan(r.gold), csvBattery(r.gold), r.bag, r.status, r.id]));
+  }
+
   function toCsv(rawRecords) {
-    const lines = [['时间', '主播', '主播UID', '礼物', '数量', '元', '电池', '来源', '状态', '记录ID']];
-    for (const r of rawRecords.map(normalize).sort((a, b) => b.ts - a.ts)) {
-      lines.push([fmtTime(r.ts), r.rname, r.ruid, r.giftName, r.giftNum, r.gold / GOLD_PER_YUAN, r.gold / GOLD_PER_BATTERY, r.bag, r.status, r.id]);
-    }
-    return String.fromCharCode(0xfeff) + lines.map((row) => row.map(csvCell).join(',')).join('\r\n');
+    return recordsCsv(rawRecords.map(normalize).sort((a, b) => b.ts - a.ts));
+  }
+
+  function streamersCsv(streamers) {
+    return csvTable(['主播', '主播UID', '元', '电池', '笔数', '第一次', '最近一次'],
+      streamers.map((s) => [s.rname, s.ruid, csvYuan(s.gold), csvBattery(s.gold), s.count, fmtDate(s.firstTs), fmtDate(s.lastTs)]));
+  }
+
+  function giftsCsv(gifts) {
+    return csvTable(['礼物', '礼物ID', '数量', '元', '电池'],
+      gifts.map((g) => [g.giftName, g.giftId, g.num, csvYuan(g.gold), csvBattery(g.gold)]));
+  }
+
+  function monthsCsv(months) {
+    return csvTable(['月份', '元', '电池'], months.map((m) => [m.month, csvYuan(m.gold), csvBattery(m.gold)]));
   }
 
   function exportJson(ledger) {
@@ -526,7 +549,7 @@
     md5, appSignedQuery, payRecordUrl, makeBiliClient, fetchAccount, fetchPayRecords, mergeRecords,
     fetchBlindInfo, fetchBlindDraws, blindBoxSummary, blindBoxCandidates,
     toNum, normalize, monthKey, summarize, fmtDate, fmtTime, yuan, battery, shortYuan,
-    csvCell, toCsv, exportJson, parseImport, sampleLedger,
+    csvCell, toCsv, recordsCsv, streamersCsv, giftsCsv, monthsCsv, exportJson, parseImport, sampleLedger,
   };
 
   if (typeof module === 'object' && module && module.exports && typeof document === 'undefined') {
@@ -674,6 +697,7 @@ button, input, select { font: inherit; color: inherit; }
 .hfill { height: 100%; background: var(--accent); border-radius: 5px; }
 .hval { font-variant-numeric: tabular-nums; font-weight: 600; }
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px; }
+.push { margin-left: auto; }
 .input { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 6px 10px; min-width: 0; }
 input.input { flex: 1 1 200px; max-width: 320px; }
 .table-wrap { overflow: auto; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
@@ -759,6 +783,28 @@ li { margin: 4px 0; }
       if (cache.key !== key || !cache.value) cache = { key, value: summarize(l ? l.records : []) };
       return cache.value;
     }
+
+    // 表格显示和导出 CSV 共用同一套筛选
+    function filteredRows(sum) {
+      const f = state.filter;
+      const q = f.q.trim().toLowerCase();
+      return sum.rows.filter((r) => (!f.ruid || r.ruid === f.ruid)
+        && (!f.month || monthKey(r.ts) === f.month)
+        && (!q || r.rname.toLowerCase().includes(q) || r.giftName.toLowerCase().includes(q)));
+    }
+
+    function filteredStreamers(sum) {
+      const q = state.streamerQuery.trim().toLowerCase();
+      return sum.streamers.filter((s) => !q || s.rname.toLowerCase().includes(q) || String(s.ruid).includes(q));
+    }
+
+    function filteredGifts(sum) {
+      const q = state.giftQuery.trim().toLowerCase();
+      return sum.gifts.filter((g) => !q || g.giftName.toLowerCase().includes(q));
+    }
+
+    const exportButton = (kind, enabled) =>
+      `<button class="btn push" data-action="export-view" data-kind="${kind}" ${enabled ? '' : 'disabled'}>导出 CSV</button>`;
 
     // ------------------------------------------------ 模板
 
@@ -852,7 +898,7 @@ li { margin: 4px 0; }
 </div>
 ${extra.length ? `<p class="hint">另有 ${esc(extra.join('、'))}，没有算进花费。</p>` : ''}
 <div class="card">
-  <div class="card-h"><h3>每月花费</h3><span class="muted small">${months.length < sum.months.length ? `最近 ${months.length} 个月` : ''}</span></div>
+  <div class="card-h"><h3>每月花费</h3><span class="muted small">${months.length < sum.months.length ? `最近 ${months.length} 个月 · ` : ''}<button class="link" data-action="export-view" data-kind="months">导出 CSV</button></span></div>
   <div class="months">${bars}</div>
 </div>
 <div class="card">
@@ -863,15 +909,14 @@ ${extra.length ? `<p class="hint">另有 ${esc(extra.join('、'))}，没有算�
 
     function streamersHtml(sum) {
       if (!sum.rows.length) return noRecordsHtml();
-      const q = state.streamerQuery.trim().toLowerCase();
-      const list = sum.streamers.filter((s) => !q || s.rname.toLowerCase().includes(q) || String(s.ruid).includes(q));
+      const list = filteredStreamers(sum);
       const rows = list.map((s, i) => `<tr class="click" data-action="filter-streamer" data-ruid="${esc(s.ruid)}">
   <td class="muted">${i + 1}</td><td><div>${esc(s.rname)}</div><div class="muted small">UID ${esc(s.ruid)}</div></td>
   <td class="r strong">${esc(yuan(s.gold))}</td><td class="r">${esc(battery(s.gold))}</td><td class="r">${fmtNum(s.count)}</td>
   <td class="nowrap">${fmtDate(s.firstTs)}</td><td class="nowrap">${fmtDate(s.lastTs)}</td></tr>`).join('');
       return `
 <div class="toolbar"><input class="input" data-input="streamerQuery" placeholder="搜索主播名或 UID" value="${esc(state.streamerQuery)}">
-  <span class="muted">${fmtNum(list.length)} 位主播，点一行看明细</span></div>
+  <span class="muted">${fmtNum(list.length)} 位主播，点一行看明细</span>${exportButton('streamers', list.length)}</div>
 <div class="table-wrap"><table>
   <thead><tr><th>#</th><th>主播</th><th class="r">花费</th><th class="r">电池</th><th class="r">笔数</th><th>第一次</th><th>最近一次</th></tr></thead>
   <tbody>${rows || '<tr><td colspan="7" class="muted center">没有匹配的主播</td></tr>'}</tbody>
@@ -880,13 +925,12 @@ ${extra.length ? `<p class="hint">另有 ${esc(extra.join('、'))}，没有算�
 
     function giftsHtml(sum) {
       if (!sum.rows.length) return noRecordsHtml();
-      const q = state.giftQuery.trim().toLowerCase();
-      const list = sum.gifts.filter((g) => !q || g.giftName.toLowerCase().includes(q));
+      const list = filteredGifts(sum);
       const rows = list.map((g) => `<tr><td><div class="gift">${img(g.giftImg)}<span>${esc(g.giftName)}</span></div></td>
   <td class="r">${fmtNum(g.num)}</td><td class="r strong">${esc(yuan(g.gold))}</td><td class="r">${esc(battery(g.gold))}</td></tr>`).join('');
       return `
 <div class="toolbar"><input class="input" data-input="giftQuery" placeholder="搜索礼物" value="${esc(state.giftQuery)}">
-  <span class="muted">${fmtNum(list.length)} 种礼物</span></div>
+  <span class="muted">${fmtNum(list.length)} 种礼物</span>${exportButton('gifts', list.length)}</div>
 <div class="table-wrap"><table>
   <thead><tr><th>礼物</th><th class="r">数量</th><th class="r">花费</th><th class="r">电池</th></tr></thead>
   <tbody>${rows || '<tr><td colspan="4" class="muted center">没有匹配的礼物</td></tr>'}</tbody>
@@ -896,10 +940,7 @@ ${extra.length ? `<p class="hint">另有 ${esc(extra.join('、'))}，没有算�
     function recordsHtml(sum) {
       if (!sum.rows.length) return noRecordsHtml();
       const f = state.filter;
-      const q = f.q.trim().toLowerCase();
-      const rows = sum.rows.filter((r) => (!f.ruid || r.ruid === f.ruid)
-        && (!f.month || monthKey(r.ts) === f.month)
-        && (!q || r.rname.toLowerCase().includes(q) || r.giftName.toLowerCase().includes(q)));
+      const rows = filteredRows(sum);
       const pages = Math.max(1, Math.ceil(rows.length / RECORDS_PAGE_SIZE));
       const page = Math.min(Math.max(1, state.page), pages);
       const slice = rows.slice((page - 1) * RECORDS_PAGE_SIZE, page * RECORDS_PAGE_SIZE);
@@ -918,6 +959,7 @@ ${extra.length ? `<p class="hint">另有 ${esc(extra.join('、'))}，没有算�
   <select class="input" data-change="filter.month"><option value="">全部月份</option>${monthOptions}</select>
   ${streamer ? `<span class="chip">${esc(streamer.rname)}<button data-action="clear-streamer" aria-label="不按主播筛选">✕</button></span>` : ''}
   <span class="muted">${fmtNum(rows.length)} 笔 · 花费 ${esc(yuan(paidGold))}</span>
+  ${exportButton('records', rows.length)}
 </div>
 <div class="table-wrap"><table>
   <thead><tr><th>时间</th><th>主播</th><th>礼物</th><th class="r">数量</th><th class="r">金额</th><th>备注</th></tr></thead>
@@ -969,7 +1011,7 @@ ${pages > 1 ? `<div class="pager">
   <div class="btns">
     ${local && state.account ? `<button class="btn primary" data-action="sync" ${state.busy ? 'disabled' : ''}>同步记录</button>` : ''}
     <button class="btn" data-action="export-json" ${count ? '' : 'disabled'}>导出 JSON（备份）</button>
-    <button class="btn" data-action="export-csv" ${count ? '' : 'disabled'}>导出 CSV（Excel）</button>
+    <button class="btn" data-action="export-csv" ${count ? '' : 'disabled'}>导出全部记录 CSV</button>
     ${local && state.account ? '<button class="btn" data-action="import">导入 JSON</button>' : ''}
     ${readOnly ? '<button class="btn" data-action="open-file">打开其他文件</button>' : ''}
     ${local && state.account ? '<button class="btn danger" data-action="clear">清空本地数据</button>' : ''}
@@ -1120,6 +1162,20 @@ ${pages > 1 ? `<div class="pager">
       return `bili-live-ledger-${l && l.uid ? l.uid : 'data'}-${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}`;
     }
 
+    function exportView(kind) {
+      const sum = summary();
+      const stem = fileStem();
+      const type = 'text/csv;charset=utf-8';
+      if (kind === 'records') {
+        const f = state.filter;
+        const filtered = f.ruid || f.month || f.q.trim();
+        return download(`${stem}-records${filtered ? '-filtered' : ''}.csv`, recordsCsv(filteredRows(sum)), type);
+      }
+      if (kind === 'streamers') return download(`${stem}-streamers.csv`, streamersCsv(filteredStreamers(sum)), type);
+      if (kind === 'gifts') return download(`${stem}-gifts.csv`, giftsCsv(filteredGifts(sum)), type);
+      if (kind === 'months') return download(`${stem}-months.csv`, monthsCsv(sum.months), type);
+    }
+
     async function importJson() {
       const file = await pickFile();
       if (!file) return;
@@ -1210,7 +1266,8 @@ ${pages > 1 ? `<div class="pager">
       if (action === 'demo') { state.demo = true; state.ledger = sampleLedger(); state.view = 'overview'; flash(); return render(); }
       if (action === 'exit-demo') { state.demo = false; state.ledger = null; state.loaded = false; flash(); return void loadAccount(); }
       if (action === 'export-json') return download(`${fileStem()}.json`, exportJson(state.ledger), 'application/json');
-      if (action === 'export-csv') return download(`${fileStem()}.csv`, toCsv(state.ledger.records), 'text/csv;charset=utf-8');
+      if (action === 'export-csv') return download(`${fileStem()}-records.csv`, toCsv(state.ledger.records), 'text/csv;charset=utf-8');
+      if (action === 'export-view') return exportView(el.dataset.kind);
       if (action === 'import') return void importJson();
       if (action === 'open-file') return void openFile();
       if (action === 'clear') return void clearData();
