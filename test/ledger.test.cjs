@@ -1,6 +1,7 @@
 'use strict';
-// 运行：node --test test/
-process.env.TZ = 'Asia/Shanghai';
+// 运行：npm test
+// 故意用美国时区跑：时间和分月必须按北京时间算，不能跟着电脑时区走。
+process.env.TZ = 'America/Los_Angeles';
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -221,17 +222,52 @@ test('export and import round-trip, and foreign files are rejected', () => {
   assert.throws(() => L.parseImport('not json'), /不是有效的 JSON/);
 });
 
+const reply = (body, status = 200) => ({ ok: status === 200, status, text: async () => (typeof body === 'string' ? body : JSON.stringify(body)) });
+
 test('makeBiliClient sends credentials and maps Bilibili error codes', async () => {
-  const loggedOut = L.makeBiliClient(async () => ({ ok: true, status: 200, json: async () => ({ code: -101, message: '账号未登录' }) }));
+  const loggedOut = L.makeBiliClient(async () => reply({ code: -101, message: '账号未登录' }));
   await assert.rejects(loggedOut.getJson('https://api.bilibili.com/x'), (e) => e.code === -101);
   assert.equal(await L.fetchAccount(loggedOut), null);
-  const limited = L.makeBiliClient(async () => ({ ok: false, status: 412, json: async () => ({}) }));
+  const limited = L.makeBiliClient(async () => reply({}, 412));
   await assert.rejects(limited.getJson('https://api.bilibili.com/x'), (e) => e.code === 412);
   const ok = L.makeBiliClient(async (url, init) => {
     assert.equal(init.credentials, 'include');
-    return { ok: true, status: 200, json: async () => ({ code: 0, data: { isLogin: true, mid: 5, uname: 'u' } }) };
+    return reply({ code: 0, data: { isLogin: true, mid: 5, uname: 'u' } });
   });
   assert.deepEqual(await L.fetchAccount(ok), { uid: 5, uname: 'u', face: '' });
+});
+
+test('record ids and next_id beyond 2^53 keep every digit', async () => {
+  const raw = '{"code":0,"data":{"list":[{"id":2113213508515164161,"timestamp":1760528274,"gift_id":32251,"ruid":3632315829848934},'
+    + '{"id":2113213508515164170,"timestamp":1760528274}],"params":{"next_id":2113213508515164170,"month":"202510"}}}';
+  const data = await L.makeBiliClient(async () => reply(raw)).getJson('https://api.live.bilibili.com/x');
+  assert.deepEqual(data.list.map((r) => r.id), ['2113213508515164161', '2113213508515164170']);
+  assert.equal(data.params.next_id, '2113213508515164170');
+  assert.equal(data.list[0].ruid, 3632315829848934); // 安全范围内的数字保持不变
+  assert.equal(data.list[0].timestamp, 1760528274);
+  assert.equal(L.parseBiliJson('{"msg":"\\"id\\":12345678901234567"}').msg, '"id":12345678901234567'); // 字符串里的内容不动
+});
+
+test('legacy rounded ids are replaced instead of duplicated', () => {
+  const legacy = { id: 2113213508515164161, timestamp: 1760528274, gift_id: 32251, ruid: 7 }; // 旧版本存下的不精确 id
+  assert.equal(legacy.id, 2113213508515164200);
+  const exact = { ...legacy, id: '2113213508515164161' };
+  const sameMs = { ...legacy, id: '2113213508515164170' }; // 同一毫秒的另一条，旧版本里被当成重复丢掉了
+  const synced = L.mergeRecords([legacy, rec(1, 100)], [exact, sameMs]);
+  assert.equal(synced.added, 1);
+  assert.deepEqual(synced.records.map((r) => r.id), ['2113213508515164161', '2113213508515164170', 1]);
+  const imported = L.mergeRecords(synced.records, [legacy]); // 再导入旧版本的备份
+  assert.equal(imported.added, 0);
+  assert.equal(imported.records.length, 3);
+});
+
+test('times and months are in Beijing time whatever the computer time zone', () => {
+  const ts = Date.UTC(2025, 9, 15, 11, 37, 54) / 1000; // 北京时间 2025-10-15 19:37:54
+  assert.equal(L.fmtTime(ts), '2025-10-15 19:37');
+  assert.equal(L.fmtDate(ts), '2025-10-15');
+  const firstOfMonth = Date.UTC(2025, 8, 30, 16, 14) / 1000; // 北京时间 2025-10-01 00:14，洛杉矶还是 9 月 30 日
+  assert.equal(L.monthKey(firstOfMonth), '2025-10');
+  assert.equal(L.summarize([rec(1, firstOfMonth)]).months[0].month, '2025-10');
 });
 
 test('the script only references bilibili.com hosts and never touches cookies', () => {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站直播消费账本
 // @namespace    bili-live-ledger
-// @version      0.2.0
+// @version      0.2.1
 // @description  在 B 站自己的页面里统计你的直播送礼消费：按主播、月份、礼物汇总，可导出。没有服务器，不需要扫码，数据只存在你的浏览器里。
 // @license      MIT
 // @match        https://live.bilibili.com/*
@@ -26,7 +26,7 @@
 (function (root) {
   'use strict';
 
-  const VERSION = '0.2.0';
+  const VERSION = '0.2.1';
 
   const API = {
     nav: 'https://api.bilibili.com/x/web-interface/nav',
@@ -129,6 +129,12 @@
 
   // ---------------------------------------------------------------- 请求 B 站接口
 
+  // 送礼记录的 id、翻页用的 next_id 是超过 2^53 的整数，直接 JSON.parse 会被四舍五入，
+  // 同一毫秒里产生的两条记录可能被当成同一条。解析前先把这几个字段改成字符串。
+  function parseBiliJson(text) {
+    return JSON.parse(text.replace(/"(id|next_id|order_id)"\s*:\s*(\d{16,})/g, '"$1":"$2"'));
+  }
+
   function makeBiliClient(fetchImpl) {
     async function getJson(url) {
       let res;
@@ -139,7 +145,7 @@
       }
       if (res.status === 412) throw new LedgerError('请求太频繁，被 B 站暂时限制了（412），过几分钟再试', 412);
       if (!res.ok) throw new LedgerError(`B 站接口返回 HTTP ${res.status}`, res.status);
-      const json = await res.json();
+      const json = parseBiliJson(await res.text());
       if (json.code === -101) throw new LedgerError('还没登录 B 站，或者登录已经失效', -101);
       if (json.code === -352) throw new LedgerError('触发了 B 站的风控（-352），请稍后再试', -352);
       if (json.code !== 0) throw new LedgerError(`B 站接口返回错误 ${json.code}：${json.message || '未知原因'}`, json.code);
@@ -203,13 +209,26 @@
     return { records, complete: false, error: new LedgerError(`已达到翻页上限 ${maxPages} 页`, 'max-pages') };
   }
 
+  // 0.2.1 之前的版本把记录 id 存成了被四舍五入的数字。同一条记录的新旧两份按「四舍五入后的 id + 时间 +
+  // 礼物 + 主播」认出来，只留精确 id 那份，避免重新同步或导入旧备份后出现重复。
+  const hasLegacyId = (r) => typeof r.id === 'number' && !Number.isSafeInteger(r.id);
+  const legacyKey = (r) => `${Number(r.id)}|${r.timestamp}|${r.gift_id}|${r.ruid}`;
+
   function mergeRecords(existing, incoming) {
     const byId = new Map(existing.map((r) => [String(r.id), r]));
+    const byLegacy = new Map(existing.map((r) => [legacyKey(r), String(r.id)]));
     let added = 0;
     for (const r of incoming) {
       const id = String(r.id);
-      if (!byId.has(id)) added++;
+      if (!byId.has(id)) {
+        const twinId = byLegacy.get(legacyKey(r));
+        const twin = twinId === undefined ? undefined : byId.get(twinId);
+        if (twin && hasLegacyId(r)) continue;
+        if (twin && hasLegacyId(twin)) byId.delete(twinId);
+        else added++;
+      }
       byId.set(id, r);
+      byLegacy.set(legacyKey(r), id);
     }
     const records = [...byId.values()].sort((a, b) => toNum(b.timestamp) - toNum(a.timestamp));
     return { records, added };
@@ -323,9 +342,13 @@
     };
   }
 
+  // B 站的记录一律按北京时间（UTC+8，没有夏令时）显示和分月，和 B 站客服导出的账单一致，不受电脑时区影响
+  const BEIJING_OFFSET_MS = 8 * 3600 * 1000;
+  const beijing = (ts) => new Date(ts * 1000 + BEIJING_OFFSET_MS);
+
   function monthKey(ts) {
-    const d = new Date(ts * 1000);
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    const d = beijing(ts);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
   }
 
   function monthRange(first, last) {
@@ -386,13 +409,13 @@
   const pad2 = (n) => String(n).padStart(2, '0');
   function fmtDate(ts) {
     if (!ts) return '—';
-    const d = new Date(ts * 1000);
-    return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+    const d = beijing(ts);
+    return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
   }
   function fmtTime(ts) {
     if (!ts) return '—';
-    const d = new Date(ts * 1000);
-    return `${fmtDate(ts)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+    const d = beijing(ts);
+    return `${fmtDate(ts)} ${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}`;
   }
   const fmtNum = (n, digits = 0) => Number(n || 0).toLocaleString('zh-CN', { maximumFractionDigits: digits });
   const yuan = (gold) => `¥${fmtNum(gold / GOLD_PER_YUAN, 2)}`;
@@ -546,7 +569,7 @@
 
   const core = {
     VERSION, API, GOLD_PER_YUAN, GOLD_PER_BATTERY, KNOWN_BLIND_BOXES, LedgerError,
-    md5, appSignedQuery, payRecordUrl, makeBiliClient, fetchAccount, fetchPayRecords, mergeRecords,
+    md5, appSignedQuery, payRecordUrl, parseBiliJson, makeBiliClient, fetchAccount, fetchPayRecords, mergeRecords,
     fetchBlindInfo, fetchBlindDraws, blindBoxSummary, blindBoxCandidates,
     toNum, normalize, monthKey, summarize, fmtDate, fmtTime, yuan, battery, shortYuan,
     csvCell, toCsv, recordsCsv, streamersCsv, giftsCsv, monthsCsv, exportJson, parseImport, sampleLedger,
@@ -896,7 +919,7 @@ li { margin: 4px 0; }
   ${kpi('送过的主播', `${fmtNum(sum.streamers.length)} 位`, top.length ? `最多：${top[0].rname}` : '')}
   ${kpi('记录范围', fmtDate(t.firstTs), `到 ${fmtDate(t.lastTs)}`)}
 </div>
-${extra.length ? `<p class="hint">另有 ${esc(extra.join('、'))}，没有算进花费。</p>` : ''}
+${extra.length ? `<p class="hint">另有 ${esc(extra.join('、'))}，没有算进花费。${t.bagCount ? '包裹礼物不是直接花钱买的（比如奇妙祈愿抽中的礼物）；B 站客服导出的消费记录会把它们按价值算进去，所以那边的总额会多出这一部分。' : ''}</p>` : ''}
 <div class="card">
   <div class="card-h"><h3>每月花费</h3><span class="muted small">${months.length < sum.months.length ? `最近 ${months.length} 个月 · ` : ''}<button class="link" data-action="export-view" data-kind="months">导出 CSV</button></span></div>
   <div class="months">${bars}</div>
@@ -1006,7 +1029,7 @@ ${pages > 1 ? `<div class="pager">
       return `
 <div class="card">
   <h3>本地数据</h3>
-  <p>共 ${fmtNum(count)} 条送礼记录${l && l.syncedAt && !state.demo ? `，上次同步 ${esc(fmtTime(l.syncedAt / 1000))}` : ''}${local && l && l.records.length && !l.fullSyncDone ? '（上次全量同步没有完成，下次同步会继续补全）' : ''}。</p>
+  <p>共 ${fmtNum(count)} 条送礼记录${l && l.syncedAt && !state.demo ? `，上次同步 ${esc(fmtTime(l.syncedAt / 1000))}（北京时间）` : ''}${local && l && l.records.length && !l.fullSyncDone ? '（上次全量同步没有完成，下次同步会继续补全）' : ''}${local && l && l.fullSyncDone && !l.idsExact && l.records.some(hasLegacyId) ? '（下次同步会重新读一遍全部记录，修正旧版本存下的记录 ID）' : ''}。</p>
   <p class="muted small">${where}</p>
   <div class="btns">
     ${local && state.account ? `<button class="btn primary" data-action="sync" ${state.busy ? 'disabled' : ''}>同步记录</button>` : ''}
@@ -1090,7 +1113,9 @@ ${pages > 1 ? `<div class="pager">
       state.progress = '正在从 B 站读取送礼记录…';
       render();
       const l = state.ledger;
-      const newestTs = l.fullSyncDone ? l.records.reduce((m, r) => Math.max(m, toNum(r.timestamp)), 0) : 0;
+      // 有旧版本留下的不精确 id 时重新全量同步一次，把接口还能拿到的记录都换成精确 id
+      const full = !l.fullSyncDone || (!l.idsExact && l.records.some(hasLegacyId));
+      const newestTs = full ? 0 : l.records.reduce((m, r) => Math.max(m, toNum(r.timestamp)), 0);
       const result = await fetchPayRecords(client, {
         newestTs,
         onPage: ({ page, total, waitingMs }) => {
@@ -1101,7 +1126,13 @@ ${pages > 1 ? `<div class="pager">
         },
       });
       const { records, added } = mergeRecords(l.records, result.records);
-      state.ledger = { ...l, records, syncedAt: Date.now(), fullSyncDone: l.fullSyncDone || result.complete };
+      state.ledger = {
+        ...l,
+        records,
+        syncedAt: Date.now(),
+        fullSyncDone: l.fullSyncDone || result.complete,
+        idsExact: l.idsExact || (full && result.complete),
+      };
       try {
         await saveLedger();
         if (result.error) flash('error', `${result.error.message}。已保存拿到的 ${result.records.length} 条，稍后可以再点同步继续。`);

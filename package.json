@@ -1,6 +1,6 @@
 {
   "name": "bili-live-ledger",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "开源、无服务器的 B 站直播消费账本（用户脚本 + 静态离线查看器）",
   "license": "MIT",
