@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B站直播消费账本</title>
+<meta name="description" content="开源、没有服务器、不用扫码的 B 站直播消费统计工具。在 B 站自己的页面里运行，记录只存在你的浏览器里。">
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --text: #18191c; --muted: #61666d; --line: #e3e5e7; --soft: #f1f2f3;
+    --accent: #fb7299; --accent-weak: #fde8ef; --good: #15935a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f1012; --panel: #18191c; --text: #e7e8ea; --muted: #9aa0a8; --line: #2b2d32; --soft: #222428; --accent-weak: #3b2129; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.65 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif; }
+  a { color: var(--accent); }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 0 16px; }
+  header.site { border-bottom: 1px solid var(--line); background: var(--panel); }
+  header.site .wrap { display: flex; align-items: center; justify-content: space-between; height: 58px; gap: 12px; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; }
+  .logo { width: 30px; height: 30px; border-radius: 8px; background: var(--accent); color: #fff; display: grid; place-items: center; }
+  nav.site a { color: var(--muted); text-decoration: none; margin-left: 16px; font-size: 14px; }
+  nav.site a:hover { color: var(--text); }
+  .hero { padding: 48px 0 28px; }
+  .hero h1 { font-size: clamp(26px, 4vw, 36px); line-height: 1.25; margin: 0 0 12px; }
+  .hero p { color: var(--muted); max-width: 640px; margin: 0 0 22px; font-size: 16px; }
+  .btn { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--text);
+    border-radius: 9px; padding: 9px 16px; font: inherit; cursor: pointer; text-decoration: none; }
+  .btn:hover { border-color: var(--accent); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; }
+  .points { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 8px 0 8px; }
+  .point { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+  .point b { display: block; margin-bottom: 4px; }
+  .point span { color: var(--muted); font-size: 14px; }
+  section { padding: 26px 0; }
+  h2 { font-size: 21px; margin: 0 0 14px; }
+  ol.steps { margin: 0; padding-left: 22px; }
+  ol.steps li { margin: 8px 0; }
+  .muted { color: var(--muted); }
+  .small { font-size: 13px; }
+  .drop { border: 2px dashed var(--line); border-radius: 14px; padding: 26px 16px; text-align: center; background: var(--panel); }
+  .drop.over { border-color: var(--accent); background: var(--accent-weak); }
+  .drop p { margin: 0 0 14px; color: var(--muted); }
+  #viewer { margin-top: 16px; }
+  #viewer-error { color: #e0464c; margin: 10px 0 0; }
+  details { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 16px; margin: 10px 0; }
+  summary { cursor: pointer; font-weight: 600; }
+  details p { margin: 10px 0 2px; color: var(--muted); }
+  code { background: var(--soft); border-radius: 5px; padding: 1px 5px; font-size: 13px; }
+  footer { border-top: 1px solid var(--line); padding: 22px 0 36px; color: var(--muted); font-size: 13px; }
+  @media (max-width: 560px) { nav.site { display: none; } .hero { padding-top: 32px; } }
+</style>
+</head>
+<body>
+<header class="site">
+  <div class="wrap">
+    <div class="brand"><span class="logo">账</span>B站直播消费账本</div>
+    <nav class="site"><a href="#install">安装</a><a href="#viewer-section">离线查看器</a><a href="#faq">常见问题</a><a href="bili-live-ledger.user.js">源码</a><a href="https://github.com/Enkianssus/bili-live-ledger" target="_blank" rel="noopener">GitHub</a></nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="hero">
+    <h1>看看你在 B 站直播花了多少钱，<br>不用把账号交给任何人。</h1>
+    <p>一个开源的用户脚本，直接在 B 站自己的页面里运行：按主播、月份、礼物统计你的送礼花费，还能算盲盒盈亏。没有服务器，不需要扫码，记录只存在你的浏览器里。</p>
+    <div class="row">
+      <a class="btn primary" href="bili-live-ledger.user.js">安装用户脚本</a>
+      <button class="btn" id="demo">先看示例数据</button>
+    </div>
+  </div>
+
+  <div class="points">
+    <div class="point"><b>不用扫码登录</b><span>用你在浏览器里本来就登录着的 B 站账号，登录凭证从头到尾不经过第三方。</span></div>
+    <div class="point"><b>没有服务器</b><span>脚本只请求 bilibili.com 自己的接口，这个网站本身也只是几个静态文件。</span></div>
+    <div class="point"><b>只读</b><span>不送礼、不点赞、不发弹幕、不关注，也不碰你的钱包。</span></div>
+    <div class="point"><b>代码都在一个文件里</b><span>不依赖任何外部库，装之前可以自己从头读一遍。</span></div>
+  </div>
+
+  <section id="install">
+    <h2>安装和使用</h2>
+    <ol class="steps">
+      <li>在浏览器里装一个用户脚本管理器：<a href="https://www.tampermonkey.net/" target="_blank" rel="noopener">Tampermonkey</a> 或开源的 <a href="https://violentmonkey.github.io/" target="_blank" rel="noopener">Violentmonkey</a>。手机上可以用 Firefox for Android 装同样的扩展，iPhone 可以用 Safari 的 Userscripts 扩展。</li>
+      <li>点上面的「安装用户脚本」，在管理器弹出的页面里确认安装。想先审查代码的话，直接点导航栏的「源码」。</li>
+      <li>打开 <a href="https://live.bilibili.com/" target="_blank" rel="noopener">live.bilibili.com</a> 并登录 B 站，点左下角的「账本」，再点「同步记录」。</li>
+    </ol>
+    <p class="muted small">第一次同步会把 B 站能给的记录都读一遍；以后再同步只补新的。B 站接口可能只提供一段时间内的记录，常打开同步，本地就会一直累积。建议在管理器里关掉这个脚本的自动更新，更新前先看一下改了什么。</p>
+  </section>
+
+  <section id="viewer-section">
+    <h2>离线查看器</h2>
+    <p class="muted">在账本的「数据」页导出 JSON 后，可以在这里打开查看。文件只在你的浏览器里读取，这个页面不会发出任何网络请求。</p>
+    <div class="drop" id="drop">
+      <p>把导出的 <code>bili-live-ledger-*.json</code> 拖到这里，或者</p>
+      <div class="row" style="justify-content:center">
+        <label class="btn primary">选择文件<input type="file" id="file" accept=".json,application/json" hidden></label>
+        <button class="btn" id="demo2">打开示例数据</button>
+      </div>
+    </div>
+    <p id="viewer-error" hidden></p>
+    <div id="viewer"></div>
+  </section>
+
+  <section id="faq">
+    <h2>常见问题</h2>
+    <details>
+      <summary>为什么不能做成一个普通网站，直接扫码登录？</summary>
+      <p>浏览器的安全规则不允许别的网站带着你的 B 站登录状态去读 B 站接口：B 站接口只对 bilibili.com 自己的页面放行。所以凡是「打开某个网站扫码登录」的统计工具，都只能让它自己的服务器替你登录、替你读数据，你的登录凭证就落在了对方服务器上。这个工具反过来做：把代码放进 B 站自己的页面里运行，凭证不用离开浏览器。</p>
+    </details>
+    <details>
+      <summary>记录存在哪里？换电脑怎么办？</summary>
+      <p>存在当前浏览器 live.bilibili.com 站点的 IndexedDB 里。换浏览器、清理网站数据都会丢失，可以用「导出 JSON」备份，再在新浏览器里「导入 JSON」。</p>
+    </details>
+    <details>
+      <summary>金额是怎么算的？</summary>
+      <p>B 站接口里的金额单位是金瓜子：1 元 = 1000 金瓜子 = 10 电池。包裹里的免费礼物和已退回的记录单独列出，不计入花费。</p>
+    </details>
+    <details>
+      <summary>会不会被 B 站封号？</summary>
+      <p>脚本只读取你自己的记录，翻页之间有间隔，遇到限流会停下来等。它用的是和 B 站 App 相同的公开接口，但毕竟不是官方工具，接口随时可能变化，没法保证。</p>
+    </details>
+    <details>
+      <summary>盲盒盈亏准吗？</summary>
+      <p>盲盒部分是实验性的：开出礼物的价值减去盲盒价格，价格来自 B 站盲盒接口。这部分接口参数来自公开资料，作者没有用真实账号完整验证过，仅供参考。</p>
+    </details>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">MIT 开源 · 非哔哩哔哩官方工具，与哔哩哔哩无关 · 所有数据只在你的浏览器里处理</div>
+</footer>
+
+<script src="bili-live-ledger.user.js"></script>
+<script>
+  (function () {
+    var viewerEl = document.getElementById('viewer');
+    var errorEl = document.getElementById('viewer-error');
+    var app = null;
+
+    function show(ledger) {
+      errorEl.hidden = true;
+      if (app) app.setLedger(ledger);
+      else app = window.BiliLedger.mountViewer(viewerEl, ledger);
+      viewerEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    function fail(message) {
+      errorEl.textContent = message;
+      errorEl.hidden = false;
+    }
+
+    function openFile(file) {
+      if (!file) return;
+      file.text().then(function (text) {
+        try { show(window.BiliLedger.parseImport(text)); } catch (e) { fail(e.message || String(e)); }
+      });
+    }
+
+    document.getElementById('file').addEventListener('change', function (e) { openFile(e.target.files[0]); });
+    document.getElementById('demo').addEventListener('click', function () { show(window.BiliLedger.sampleLedger()); });
+    document.getElementById('demo2').addEventListener('click', function () { show(window.BiliLedger.sampleLedger()); });
+
+    var drop = document.getElementById('drop');
+    drop.addEventListener('dragover', function (e) { e.preventDefault(); drop.classList.add('over'); });
+    drop.addEventListener('dragleave', function () { drop.classList.remove('over'); });
+    drop.addEventListener('drop', function (e) {
+      e.preventDefault();
+      drop.classList.remove('over');
+      openFile(e.dataTransfer.files[0]);
+    });
+  })();
+</script>
+</body>
+</html>

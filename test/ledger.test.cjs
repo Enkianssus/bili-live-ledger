@@ -1,0 +1,223 @@
+'use strict';
+// 运行：node --test test/
+process.env.TZ = 'Asia/Shanghai';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const L = require('../bili-live-ledger.user.js');
+
+const APP_SEC = '560c52ccd288fed045859ed18bffd973';
+const nodeMd5 = (s) => crypto.createHash('md5').update(s, 'utf8').digest('hex');
+const noWait = async () => {};
+const rec = (id, ts, extra = {}) => ({
+  id, timestamp: ts, gift_id: 1, gift_name: '小花花', gift_num: 1, pay_coin: '100', coin: '100', ruid: 7, r_uname: '主播A', ...extra,
+});
+
+function pagedClient(pages) {
+  const calls = [];
+  return {
+    calls,
+    async getJson(url) {
+      const next = new URL(url).searchParams.get('next_id') || '';
+      calls.push(next);
+      const page = pages[next];
+      if (page instanceof Error) throw page;
+      if (!page) throw new Error(`unexpected page ${next}`);
+      return page;
+    },
+  };
+}
+
+test('md5 matches node:crypto', () => {
+  const inputs = ['', 'abc', 'message digest', 'a'.repeat(55), 'a'.repeat(56), 'a'.repeat(64), 'a'.repeat(1000), '中文签名测试🎁', '{"appId":1}'];
+  for (const s of inputs) assert.equal(L.md5(s), nodeMd5(s), s);
+});
+
+test('appSignedQuery sorts params and signs with the app secret', () => {
+  const [query, sign] = L.appSignedQuery({ b: '2', a: 'x y' }, 1700000000).split('&sign=');
+  assert.equal(query, 'a=x%20y&appkey=1d8b6e7d45233436&b=2&ts=1700000000');
+  assert.equal(sign, nodeMd5(query + APP_SEC));
+});
+
+test('payRecordUrl carries next_id and a valid sign', () => {
+  const url = new URL(L.payRecordUrl('abc123', 1700000000));
+  assert.equal(url.origin + url.pathname, L.API.payRecord);
+  assert.equal(url.searchParams.get('next_id'), 'abc123');
+  assert.equal(url.searchParams.get('coin_type'), 'gold');
+  const [query, sign] = url.search.slice(1).split('&sign=');
+  assert.equal(sign, nodeMd5(query + APP_SEC));
+});
+
+test('full sync pages through next_id until the list ends', async () => {
+  const client = pagedClient({
+    '': { list: [rec(3, 300), rec(2, 200)], params: { next_id: 'n1' } },
+    n1: { list: [rec(1, 100)], params: { next_id: '' } },
+  });
+  const res = await L.fetchPayRecords(client, { wait: noWait });
+  assert.equal(res.complete, true);
+  assert.equal(res.error, null);
+  assert.deepEqual(res.records.map((r) => r.id), [3, 2, 1]);
+  assert.deepEqual(client.calls, ['', 'n1']);
+});
+
+test('incremental sync stops once it passes the 7-day backtrack window', async () => {
+  const day = 86400;
+  const now = 1700000000;
+  const client = pagedClient({
+    '': { list: [rec(5, now), rec(4, now - 3 * day), rec(3, now - 9 * day)], params: { next_id: 'n1' } },
+  });
+  const res = await L.fetchPayRecords(client, { newestTs: now - day, wait: noWait });
+  assert.equal(res.complete, true);
+  assert.deepEqual(res.records.map((r) => r.id), [5, 4]);
+  assert.deepEqual(client.calls, ['']);
+});
+
+test('an error mid-sync keeps the records fetched so far', async () => {
+  const err = new L.LedgerError('风控', -352);
+  const client = pagedClient({ '': { list: [rec(2, 200)], params: { next_id: 'n1' } }, n1: err });
+  const res = await L.fetchPayRecords(client, { wait: noWait });
+  assert.equal(res.complete, false);
+  assert.equal(res.error, err);
+  assert.deepEqual(res.records.map((r) => r.id), [2]);
+});
+
+test('a 412 rate limit waits once and retries the same page', async () => {
+  let calls = 0;
+  const waits = [];
+  const client = {
+    async getJson() {
+      calls++;
+      if (calls === 1) throw new L.LedgerError('limited', 412);
+      return { list: [rec(1, 100)], params: {} };
+    },
+  };
+  const res = await L.fetchPayRecords(client, { wait: async (ms) => { waits.push(ms); } });
+  assert.equal(res.complete, true);
+  assert.equal(calls, 2);
+  assert.deepEqual(waits, [30000]);
+});
+
+test('a repeated page stops instead of looping forever', async () => {
+  const page = { list: [rec(1, 100)], params: { next_id: 'same' } };
+  const res = await L.fetchPayRecords({ getJson: async () => page }, { wait: noWait });
+  assert.equal(res.complete, false);
+  assert.equal(res.error.code, 'loop');
+  assert.equal(res.records.length, 1);
+});
+
+test('mergeRecords dedupes by id, keeps the newer copy and sorts by time', () => {
+  const { records, added } = L.mergeRecords([rec(1, 100), rec(2, 200)], [rec(2, 200, { status_msg: '已退回' }), rec(3, 300)]);
+  assert.equal(added, 1);
+  assert.deepEqual(records.map((r) => r.id), [3, 2, 1]);
+  assert.equal(records[1].status_msg, '已退回');
+});
+
+test('summarize leaves refunds and bag gifts out of spending', () => {
+  const s = L.summarize([
+    rec(1, 1696089600, { pay_coin: '1,000' }), // 2023-10-01 00:00 (+08)
+    rec(2, 1698768000, { pay_coin: '52000', gift_id: 2, gift_name: '告白气球', ruid: 8, r_uname: '主播B' }), // 2023-11-01
+    rec(3, 1698768100, { pay_coin: '5000', status_msg: '已退回' }),
+    rec(4, 1698768200, { pay_coin: '0', coin: '100', bag_desc: '包裹道具' }),
+    rec(5, 1704067200, { pay_coin: '100', r_uname: '主播A改名' }), // 2024-01-01
+  ]);
+  assert.equal(s.totals.paidGold, 53100);
+  assert.equal(s.totals.paidCount, 3);
+  assert.equal(s.totals.refundGold, 5000);
+  assert.equal(s.totals.bagCount, 1);
+  assert.equal(s.totals.bagValueGold, 100);
+  assert.deepEqual(s.streamers.map((x) => [x.ruid, x.gold, x.rname]), [[8, 52000, '主播B'], [7, 1100, '主播A改名']]);
+  assert.deepEqual(s.months.map((m) => [m.month, m.gold]), [['2023-10', 1000], ['2023-11', 52000], ['2023-12', 0], ['2024-01', 100]]);
+  assert.equal(L.yuan(s.totals.paidGold), '¥53.1');
+  assert.equal(L.battery(s.totals.paidGold), '531');
+});
+
+test('pay_coin falls back to coin only when it is missing', () => {
+  assert.equal(L.normalize(rec(1, 1, { pay_coin: '', coin: '300' })).gold, 300);
+  assert.equal(L.normalize(rec(1, 1, { pay_coin: '0', coin: '300' })).gold, 0);
+});
+
+test('blindBoxSummary computes profit and flags unknown prices', () => {
+  const info = { id: 1, name: '盲盒', priceGold: 15000, gifts: [{ giftId: 11, name: 'A', priceGold: 5000 }, { giftId: 12, name: 'B', priceGold: 60000 }] };
+  const s = L.blindBoxSummary(info, [
+    { gift_id: 11, gift_name: 'A', gift_num: 2 },
+    { gift_id: 12, gift_name: 'B', gift_num: 1 },
+    { gift_id: 99, gift_name: 'X', gift_num: 1 },
+  ]);
+  assert.equal(s.boxes, 4);
+  assert.equal(s.costGold, 60000);
+  assert.equal(s.valueGold, 70000);
+  assert.equal(s.profitGold, 10000);
+  assert.equal(s.unknown, 1);
+});
+
+test('fetchBlindDraws follows params pagination and stops at known draws', async () => {
+  const cursors = [];
+  const client = {
+    async getJson(url) {
+      const cursor = new URL(url).searchParams.get('cursor');
+      cursors.push(cursor);
+      return cursor
+        ? { list: [{ timestamp: 200 }, { timestamp: 100 }], params: { cursor: 'c3', have_more: 1 } }
+        : { list: [{ timestamp: 300 }, { timestamp: 250 }], params: { cursor: 'c2', have_more: 1 } };
+    },
+  };
+  const draws = await L.fetchBlindDraws(client, 32251, { sinceTs: 150, wait: noWait });
+  assert.deepEqual(draws.map((d) => d.timestamp), [300, 250, 200]);
+  assert.deepEqual(cursors, [null, 'c2']);
+});
+
+test('blindBoxCandidates adds blind boxes found in the records', () => {
+  const ids = L.blindBoxCandidates([rec(1, 1, { gift_id: 777, gift_name: '新年盲盒' }), rec(2, 1)], { 888: {} });
+  for (const id of [...L.KNOWN_BLIND_BOXES, 777, 888]) assert.ok(ids.includes(id), String(id));
+  assert.ok(!ids.includes(1));
+});
+
+test('CSV export neutralises formulas and quotes commas', () => {
+  const csv = L.toCsv([rec(1, 1698768000, { r_uname: '=HYPERLINK("x")', gift_name: '花,花' })]);
+  assert.ok(csv.startsWith(String.fromCharCode(0xfeff) + '时间,主播'));
+  assert.ok(csv.includes(`"'=HYPERLINK(""x"")"`));
+  assert.ok(csv.includes('"花,花"'));
+});
+
+test('export and import round-trip, and foreign files are rejected', () => {
+  const ledger = { uid: 42, uname: '我', records: [rec(1, 100)], blind: {} };
+  const back = L.parseImport(L.exportJson(ledger));
+  assert.equal(back.uid, 42);
+  assert.deepEqual(back.records, ledger.records);
+  assert.throws(() => L.parseImport('{"format":"other","records":[]}'), /不是本工具导出的文件/);
+  assert.throws(() => L.parseImport('not json'), /不是有效的 JSON/);
+});
+
+test('makeBiliClient sends credentials and maps Bilibili error codes', async () => {
+  const loggedOut = L.makeBiliClient(async () => ({ ok: true, status: 200, json: async () => ({ code: -101, message: '账号未登录' }) }));
+  await assert.rejects(loggedOut.getJson('https://api.bilibili.com/x'), (e) => e.code === -101);
+  assert.equal(await L.fetchAccount(loggedOut), null);
+  const limited = L.makeBiliClient(async () => ({ ok: false, status: 412, json: async () => ({}) }));
+  await assert.rejects(limited.getJson('https://api.bilibili.com/x'), (e) => e.code === 412);
+  const ok = L.makeBiliClient(async (url, init) => {
+    assert.equal(init.credentials, 'include');
+    return { ok: true, status: 200, json: async () => ({ code: 0, data: { isLogin: true, mid: 5, uname: 'u' } }) };
+  });
+  assert.deepEqual(await L.fetchAccount(ok), { uid: 5, uname: 'u', face: '' });
+});
+
+test('the script only references bilibili.com hosts and never touches cookies', () => {
+  const src = fs.readFileSync(require.resolve('../bili-live-ledger.user.js'), 'utf8');
+  const hosts = [...src.matchAll(/https?:\/\/([a-z0-9.-]+)/gi)].map((m) => m[1].toLowerCase());
+  assert.ok(hosts.length > 0);
+  for (const h of hosts) assert.ok(h === 'bilibili.com' || h.endsWith('.bilibili.com'), `unexpected host ${h}`);
+  assert.ok(!/document\.cookie/.test(src.replace('不读取 document.cookie', '')));
+  assert.ok(!/GM_xmlhttpRequest|@connect|@require/.test(src));
+});
+
+test('the sample ledger is self-consistent', () => {
+  const l = L.sampleLedger(1700000000);
+  const s = L.summarize(l.records);
+  assert.equal(l.records.length, 420);
+  assert.ok(s.totals.paidGold > 0);
+  assert.ok(s.streamers.length >= 5);
+  const box = Object.values(l.blind)[0];
+  assert.equal(L.blindBoxSummary(box.info, box.draws).boxes, 90);
+});
