@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站直播消费账本
 // @namespace    bili-live-ledger
-// @version      0.1.0
+// @version      0.1.1
 // @description  在 B 站自己的页面里统计你的直播送礼消费：按主播、月份、礼物汇总，可导出。没有服务器，不需要扫码，数据只存在你的浏览器里。
 // @license      MIT
 // @match        https://live.bilibili.com/*
@@ -26,7 +26,7 @@
 (function (root) {
   'use strict';
 
-  const VERSION = '0.1.0';
+  const VERSION = '0.1.1';
 
   const API = {
     nav: 'https://api.bilibili.com/x/web-interface/nav',
@@ -40,7 +40,8 @@
   const APP_KEY = '1d8b6e7d45233436';
   const APP_SEC = '560c52ccd288fed045859ed18bffd973';
 
-  // 接口里的金额单位是金瓜子：1 元 = 1000 金瓜子，1 电池 = 100 金瓜子。
+  // 统计时统一用金瓜子做单位：1 元 = 1000 金瓜子，1 电池 = 100 金瓜子。
+  // 送礼记录接口给的金额是电池（心动盲盒记作 150），盲盒接口给的价格是金瓜子。
   const GOLD_PER_YUAN = 1000;
   const GOLD_PER_BATTERY = 100;
 
@@ -310,8 +311,8 @@
       giftName: String(r.gift_name || '未知礼物'),
       giftNum: toNum(r.gift_num) || 1,
       giftImg: String(r.gift_img || ''),
-      gold: toNum(present(r.pay_coin) ? r.pay_coin : r.coin),
-      valueGold: toNum(present(r.coin) ? r.coin : r.pay_coin),
+      gold: toNum(present(r.pay_coin) ? r.pay_coin : r.coin) * GOLD_PER_BATTERY,
+      valueGold: toNum(present(r.coin) ? r.coin : r.pay_coin) * GOLD_PER_BATTERY,
       ruid: toNum(r.ruid),
       rname: String(r.r_uname || r.rname || (r.ruid ? `UID ${r.ruid}` : '未知主播')),
       bag,
@@ -408,9 +409,9 @@
   }
 
   function toCsv(rawRecords) {
-    const lines = [['时间', '主播', '主播UID', '礼物', '数量', '金瓜子', '元', '电池', '来源', '状态', '记录ID']];
+    const lines = [['时间', '主播', '主播UID', '礼物', '数量', '元', '电池', '来源', '状态', '记录ID']];
     for (const r of rawRecords.map(normalize).sort((a, b) => b.ts - a.ts)) {
-      lines.push([fmtTime(r.ts), r.rname, r.ruid, r.giftName, r.giftNum, r.gold, r.gold / GOLD_PER_YUAN, r.gold / GOLD_PER_BATTERY, r.bag, r.status, r.id]);
+      lines.push([fmtTime(r.ts), r.rname, r.ruid, r.giftName, r.giftNum, r.gold / GOLD_PER_YUAN, r.gold / GOLD_PER_BATTERY, r.bag, r.status, r.id]);
     }
     return String.fromCharCode(0xfeff) + lines.map((row) => row.map(csvCell).join(',')).join('\r\n');
   }
@@ -462,9 +463,9 @@
       [900001, '示例主播·星野', 5], [900002, '示例主播·阿宁', 3], [900003, '示例主播·小鹿', 2],
       [900004, '示例主播·北辰', 1.5], [900005, '示例主播·糖糖', 1], [900006, '示例主播·老周', 0.6],
     ];
-    const gifts = [
-      [910001, '小花花', 100, 12], [910002, '这个好诶', 1000, 6], [910003, '打call', 5000, 4],
-      [910004, '告白气球', 52000, 1.2], [910005, '星愿水晶球', 100000, 0.5], [910006, '小电视飞船', 1245000, 0.08],
+    const gifts = [ // 价格单位和送礼记录接口一致：电池
+      [910001, '小花花', 1, 12], [910002, '这个好诶', 10, 6], [910003, '打call', 50, 4],
+      [910004, '告白气球', 520, 1.2], [910005, '星愿水晶球', 1000, 0.5], [910006, '小电视飞船', 12450, 0.08],
     ];
     const pick = (list, wi) => {
       const total = list.reduce((a, x) => a + x[wi], 0);
@@ -476,7 +477,7 @@
     for (let i = 0; i < 420; i++) {
       const [ruid, rname] = pick(streamers, 2);
       const [giftId, giftName, price] = pick(gifts, 3);
-      const num = price <= 1000 ? 1 + Math.floor(rand() * 10) : 1;
+      const num = price <= 10 ? 1 + Math.floor(rand() * 10) : 1;
       const ts = now - Math.floor(rand() * 300 * 86400);
       const roll = rand();
       records.push({
@@ -981,7 +982,7 @@ ${pages > 1 ? `<div class="pager">
     <li>不读取、不保存你的 Cookie 或任何登录凭证，不连接 B 站以外的任何服务器。</li>
     <li>只读：不会送礼、点赞、发弹幕、关注主播，也不会动你的钱包。</li>
     <li>B 站接口可能只提供一段时间内的记录；定期打开同步，本地记录就会一直累积下去。</li>
-    <li>金额按接口里的金瓜子换算：1 元 = 1000 金瓜子 = 10 电池。</li>
+    <li>金额单位：1 元 = 10 电池。</li>
   </ul>
   <p class="muted small" style="margin:10px 0 0">版本 ${esc(VERSION)} · MIT 开源 · 非 B 站官方工具</p>
 </div>`;

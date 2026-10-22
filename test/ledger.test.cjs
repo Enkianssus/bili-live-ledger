@@ -115,12 +115,13 @@ test('mergeRecords dedupes by id, keeps the newer copy and sorts by time', () =>
 });
 
 test('summarize leaves refunds and bag gifts out of spending', () => {
+  // 送礼记录的金额单位是电池；统计结果统一用金瓜子（1 电池 = 100 金瓜子）
   const s = L.summarize([
-    rec(1, 1696089600, { pay_coin: '1,000' }), // 2023-10-01 00:00 (+08)
-    rec(2, 1698768000, { pay_coin: '52000', gift_id: 2, gift_name: '告白气球', ruid: 8, r_uname: '主播B' }), // 2023-11-01
-    rec(3, 1698768100, { pay_coin: '5000', status_msg: '已退回' }),
-    rec(4, 1698768200, { pay_coin: '0', coin: '100', bag_desc: '包裹道具' }),
-    rec(5, 1704067200, { pay_coin: '100', r_uname: '主播A改名' }), // 2024-01-01
+    rec(1, 1696089600, { pay_coin: '10' }), // 2023-10-01 00:00 (+08)
+    rec(2, 1698768000, { pay_coin: '520', gift_id: 2, gift_name: '告白气球', ruid: 8, r_uname: '主播B' }), // 2023-11-01
+    rec(3, 1698768100, { pay_coin: '50', status_msg: '已退回' }),
+    rec(4, 1698768200, { pay_coin: '0', coin: '1', bag_desc: '包裹道具' }),
+    rec(5, 1704067200, { pay_coin: '1', r_uname: '主播A改名' }), // 2024-01-01
   ]);
   assert.equal(s.totals.paidGold, 53100);
   assert.equal(s.totals.paidCount, 3);
@@ -134,8 +135,20 @@ test('summarize leaves refunds and bag gifts out of spending', () => {
 });
 
 test('pay_coin falls back to coin only when it is missing', () => {
-  assert.equal(L.normalize(rec(1, 1, { pay_coin: '', coin: '300' })).gold, 300);
+  assert.equal(L.normalize(rec(1, 1, { pay_coin: '', coin: '300' })).gold, 30000);
   assert.equal(L.normalize(rec(1, 1, { pay_coin: '0', coin: '300' })).gold, 0);
+});
+
+test('pay record amounts are in batteries (real records reported by a user)', () => {
+  const box = L.normalize(rec(1, 1, { gift_name: '心动盲盒', pay_coin: '150' }));
+  assert.equal(L.yuan(box.gold), '¥15');
+  assert.equal(L.battery(box.gold), '150');
+  const admiral = L.normalize(rec(2, 1, { gift_name: '提督', pay_coin: '15980' }));
+  assert.equal(L.yuan(admiral.gold), '¥1,598');
+  assert.equal(L.battery(admiral.gold), '15,980');
+  const csv = L.toCsv([rec(3, 1698768000, { gift_name: '心动盲盒', pay_coin: '150' })]).split('\r\n');
+  assert.equal(csv[0].replace(String.fromCharCode(0xfeff), ''), '时间,主播,主播UID,礼物,数量,元,电池,来源,状态,记录ID');
+  assert.ok(csv[1].includes(',心动盲盒,1,15,150,'), csv[1]);
 });
 
 test('blindBoxSummary computes profit and flags unknown prices', () => {
