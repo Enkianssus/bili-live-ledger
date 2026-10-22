@@ -51,6 +51,46 @@ test('payRecordUrl carries next_id and a valid sign', () => {
   assert.equal(sign, nodeMd5(query + APP_SEC));
 });
 
+test('payRecordUrl can ask for a specific month and still signs it', () => {
+  const url = new URL(L.payRecordUrl('', 1700000000, { month: '202509' }));
+  assert.equal(url.searchParams.get('month'), '202509');
+  assert.equal(url.searchParams.get('next_id'), null);
+  const [query, sign] = url.search.slice(1).split('&sign=');
+  assert.equal(sign, nodeMd5(query + APP_SEC));
+});
+
+test('history probe records each answer and tells a data limit from a refusal', async () => {
+  const earliest = { id: '2113213508515164161', timestamp: Date.UTC(2025, 8, 30, 16, 14) / 1000 }; // 北京时间 2025-10-01 00:14
+  const asked = [];
+  const client = {
+    async getJson(url) {
+      const q = new URL(url).searchParams;
+      asked.push([q.get('next_id'), q.get('month')]);
+      if (q.get('month') === '202510') return { list: [{ id: '1', timestamp: earliest.timestamp + 3600 }], params: { month: '202510' } };
+      if (q.get('month')) return { list: [], params: { month: q.get('month') } };
+      if (q.get('next_id')) return { list: [], params: { next_id: '' } };
+      return { list: [{ id: '9', timestamp: 1790000000 }], params: { next_id: '9', month: '202610' } };
+    },
+  };
+  const results = await L.probeHistory(client, earliest, { wait: noWait });
+  assert.deepEqual(asked, [[null, null], ['2113213508515164161', null], [null, '202510'], [null, '202509'], [null, '202506']]);
+  assert.equal(results[0].nextIdIsLastId, true);
+  const verdict = L.judgeProbe(results, earliest.timestamp);
+  assert.equal(verdict.kind, 'limit');
+  assert.match(verdict.text, /认得「指定月份」参数/);
+
+  const older = { name: 'x', ok: true, count: 1, oldestTs: earliest.timestamp - 86400, newestTs: earliest.timestamp - 86400 };
+  assert.equal(L.judgeProbe([older], earliest.timestamp).kind, 'found');
+  assert.equal(L.judgeProbe([{ name: 'y', ok: false, code: -352, message: '风控' }], earliest.timestamp).kind, 'blocked');
+  assert.equal(L.judgeProbe([{ name: 'z', ok: false, code: 412, message: '限流' }], earliest.timestamp).kind, 'blocked');
+
+  const refused = await L.probeHistory({ getJson: async () => { throw new L.LedgerError('风控', -352); } }, earliest, { wait: noWait });
+  assert.ok(refused.every((r) => r.ok === false && r.code === -352));
+
+  const legacy = await L.probeHistory(client, { id: 2113213508515164161, timestamp: earliest.timestamp }, { wait: noWait });
+  assert.ok(legacy[1].skipped, 'a rounded legacy id cannot be used to keep paging');
+});
+
 test('full sync pages through next_id until the list ends', async () => {
   const client = pagedClient({
     '': { list: [rec(3, 300), rec(2, 200)], params: { next_id: 'n1' } },

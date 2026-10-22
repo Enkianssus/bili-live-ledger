@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站直播消费账本
 // @namespace    bili-live-ledger
-// @version      0.2.1
+// @version      0.3.0
 // @description  在 B 站自己的页面里统计你的直播送礼消费：按主播、月份、礼物汇总，可导出。没有服务器，不需要扫码，数据只存在你的浏览器里。
 // @license      MIT
 // @match        https://live.bilibili.com/*
@@ -26,7 +26,7 @@
 (function (root) {
   'use strict';
 
-  const VERSION = '0.2.1';
+  const VERSION = '0.3.0';
 
   const API = {
     nav: 'https://api.bilibili.com/x/web-interface/nav',
@@ -107,8 +107,9 @@
     return `${query}&sign=${md5(query + APP_SEC)}`;
   }
 
-  function payRecordUrl(nextId, ts) {
+  function payRecordUrl(nextId, ts, extra = {}) {
     const params = {
+      ...extra,
       actionKey: 'appkey',
       build: '8870400',
       c_locale: 'zh-Hans_CN',
@@ -232,6 +233,84 @@
     }
     const records = [...byId.values()].sort((a, b) => toNum(b.timestamp) - toNum(a.timestamp));
     return { records, added };
+  }
+
+  // ---------------------------------------------------------------- 诊断：能不能读到更早的记录
+
+  const RISK_CODES = new Set([412, -352, -412, -509, -799]); // 限流、风控拦截、请求过于频繁
+
+  function shiftMonth(month, delta) {
+    let [y, m] = month.split('-').map(Number);
+    m += delta;
+    while (m < 1) { m += 12; y--; }
+    while (m > 12) { m -= 12; y++; }
+    return `${y}-${String(m).padStart(2, '0')}`;
+  }
+
+  function describePage(data) {
+    const list = Array.isArray(data?.list) ? data.list : [];
+    const times = list.map((r) => toNum(r.timestamp)).filter(Boolean);
+    const params = data?.params && typeof data.params === 'object' ? data.params : {};
+    const lastId = list.length ? String(list[list.length - 1].id) : '';
+    return {
+      count: list.length,
+      newestTs: times.length ? Math.max(...times) : 0,
+      oldestTs: times.length ? Math.min(...times) : 0,
+      params,
+      nextIdIsLastId: lastId !== '' && String(params.next_id ?? '') === lastId,
+    };
+  }
+
+  // 换几种方式向送礼记录接口要比账本最早一条更早的记录，记下接口每次的真实回应
+  async function probeHistory(client, earliest, { wait = sleep, delayMs = 1500, onStep } = {}) {
+    const first = monthKey(toNum(earliest.timestamp));
+    const byMonth = (month, note) => ({ name: `指定月份 ${month}${note}`, nextId: '', extra: { month: month.replace('-', '') } });
+    const probes = [
+      { name: '第一页（和同步时一样）', nextId: '', extra: {} },
+      hasLegacyId(earliest)
+        ? { name: '从账本最早一条接着往前翻', skip: '账本里的记录 ID 还是旧版本存的，先点一次「同步记录」再检查' }
+        : { name: '从账本最早一条接着往前翻', nextId: String(earliest.id), extra: {} },
+      byMonth(first, '（账本最早的月份）'),
+      byMonth(shiftMonth(first, -1), ''),
+      byMonth(shiftMonth(first, -4), ''),
+    ];
+    const results = [];
+    for (const p of probes) {
+      onStep?.(p.name);
+      if (p.skip) {
+        results.push({ name: p.name, skipped: p.skip });
+        continue;
+      }
+      try {
+        const data = await client.getJson(payRecordUrl(p.nextId, undefined, p.extra));
+        results.push({ name: p.name, month: p.extra.month || '', ok: true, code: 0, ...describePage(data) });
+      } catch (e) {
+        results.push({ name: p.name, month: p.extra.month || '', ok: false, code: e.code, message: e.message });
+      }
+      if (p !== probes[probes.length - 1]) await wait(delayMs);
+    }
+    return results;
+  }
+
+  function judgeProbe(results, earliestTs) {
+    const older = results.find((r) => r.ok && r.oldestTs && r.oldestTs < earliestTs);
+    if (older) {
+      return { kind: 'found', text: `「${older.name}」拿到了比账本更早的记录（最早 ${fmtTime(older.oldestTs)}），更早的记录还能读到，可以照这个办法补全历史。` };
+    }
+    const blocked = results.find((r) => r.ok === false && RISK_CODES.has(r.code));
+    if (blocked) {
+      return { kind: 'blocked', text: `「${blocked.name}」被 B 站拒绝了（${blocked.code}：${blocked.message}），可能是风控拦截。过半小时再检查一次，还是这样就说明确实被拦了。` };
+    }
+    const failed = results.find((r) => r.ok === false);
+    if (failed) return { kind: 'error', text: `「${failed.name}」返回错误 ${failed.code}：${failed.message}。` };
+    const honorsMonth = results.some((r) => r.ok && r.month && r.count && monthKey(r.newestTs).replace('-', '') === r.month);
+    return {
+      kind: 'limit',
+      text: '所有请求都被正常受理（code 0），但没有一条比账本最早的记录更早：不是被拒绝，而是接口本身只提供这段时间的记录。'
+        + (honorsMonth
+          ? '接口认得「指定月份」参数（指定账本最早的月份时返回了那个月的记录），所以再往前的月份是确实没有数据。'
+          : '接口没有理会「指定月份」参数，返回的还是最近的记录。'),
+    };
   }
 
   // ---------------------------------------------------------------- 盲盒（实验性）
@@ -570,6 +649,7 @@
   const core = {
     VERSION, API, GOLD_PER_YUAN, GOLD_PER_BATTERY, KNOWN_BLIND_BOXES, LedgerError,
     md5, appSignedQuery, payRecordUrl, parseBiliJson, makeBiliClient, fetchAccount, fetchPayRecords, mergeRecords,
+    probeHistory, judgeProbe,
     fetchBlindInfo, fetchBlindDraws, blindBoxSummary, blindBoxCandidates,
     toNum, normalize, monthKey, summarize, fmtDate, fmtTime, yuan, battery, shortYuan,
     csvCell, toCsv, recordsCsv, streamersCsv, giftsCsv, monthsCsv, exportJson, parseImport, sampleLedger,
@@ -737,6 +817,8 @@ tr.dim td { color: var(--muted); }
 .small { font-size: 12px; }
 .center { text-align: center; }
 .nowrap { white-space: nowrap; }
+.wrap { word-break: break-all; }
+textarea.input { width: 100%; font: 12px/1.4 ui-monospace, Consolas, monospace; resize: vertical; }
 .gift { display: flex; align-items: center; gap: 6px; }
 .gift img, .noimg { width: 24px; height: 24px; object-fit: contain; flex: none; }
 .chip { display: inline-flex; align-items: center; gap: 2px; padding: 3px 4px 3px 10px; border-radius: 999px; background: var(--accent-weak); }
@@ -797,6 +879,7 @@ li { margin: 4px 0; }
       giftQuery: '',
       filter: { q: '', month: '', ruid: 0 },
       page: 1,
+      probe: null,
     };
 
     let cache = { key: '', value: null };
@@ -824,6 +907,11 @@ li { margin: 4px 0; }
     function filteredGifts(sum) {
       const q = state.giftQuery.trim().toLowerCase();
       return sum.gifts.filter((g) => !q || g.giftName.toLowerCase().includes(q));
+    }
+
+    function earliestRecord() {
+      const records = state.ledger ? state.ledger.records : [];
+      return records.reduce((m, r) => (!m || toNum(r.timestamp) < toNum(m.timestamp) ? r : m), null);
     }
 
     const exportButton = (kind, enabled) =>
@@ -1040,6 +1128,7 @@ ${pages > 1 ? `<div class="pager">
     ${local && state.account ? '<button class="btn danger" data-action="clear">清空本地数据</button>' : ''}
   </div>
 </div>
+${local && state.account && earliestRecord() ? probeHtml() : ''}
 <div class="card">
   <h3>这个工具做什么、不做什么</h3>
   <ul>
@@ -1050,6 +1139,33 @@ ${pages > 1 ? `<div class="pager">
     <li>金额单位：1 元 = 10 电池。</li>
   </ul>
   <p class="muted small" style="margin:10px 0 0">版本 ${esc(VERSION)} · MIT 开源 · 非 B 站官方工具</p>
+</div>`;
+    }
+
+    function probeHtml() {
+      const earliest = earliestRecord();
+      const p = state.probe;
+      const rows = p ? p.results.map((r) => `<tr>
+  <td>${esc(r.name)}</td>
+  <td>${r.skipped ? `<span class="muted">${esc(r.skipped)}</span>`
+    : r.ok ? '<span class="good">正常（code 0）</span>' : `<span class="bad">${esc(r.code)}：${esc(r.message)}</span>`}</td>
+  <td class="r">${r.ok ? fmtNum(r.count) : ''}</td>
+  <td class="nowrap">${r.ok && r.count ? `${esc(fmtTime(r.oldestTs))} ~ ${esc(fmtTime(r.newestTs))}` : ''}</td>
+  <td class="small muted wrap">${r.ok ? esc(JSON.stringify(r.params)) : ''}</td></tr>`).join('') : '';
+      const raw = p ? JSON.stringify({ version: VERSION, earliest: fmtTime(toNum(earliest.timestamp)), results: p.results }, null, 2) : '';
+      return `
+<div class="card">
+  <h3>诊断：能不能读到更早的记录</h3>
+  <p class="muted small">账本最早的一条是 ${esc(fmtTime(toNum(earliest.timestamp)))}（北京时间）。这个检查会换几种方式向 B 站要更早的记录：接着往前翻页、指定月份，一共 5 次请求，每次间隔 1.5 秒，只读，不改动本地数据。结果能看出接口是正常返回了空结果，还是拒绝了请求。</p>
+  <div class="btns">
+    <button class="btn" data-action="probe" ${state.busy ? 'disabled' : ''}>${p && p.verdict ? '再检查一次' : '开始检查'}</button>
+    ${p && p.verdict ? '<button class="btn" data-action="copy-probe">复制检查结果</button>' : ''}
+  </div>
+  ${p && p.verdict ? `<p class="${p.verdict.kind === 'found' ? 'good' : p.verdict.kind === 'limit' ? '' : 'bad'}" style="margin:12px 0 8px">${esc(p.verdict.text)}</p>` : ''}
+  ${rows ? `<div class="table-wrap"><table>
+    <thead><tr><th>方式</th><th>接口回应</th><th class="r">条数</th><th>返回记录的时间</th><th>接口返回的翻页参数</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>` : ''}
+  ${raw ? `<details style="margin-top:10px"><summary class="muted small">原始结果（不含任何登录信息）</summary><textarea class="input" rows="8" readonly>${esc(raw)}</textarea></details>` : ''}
 </div>`;
     }
 
@@ -1187,6 +1303,33 @@ ${pages > 1 ? `<div class="pager">
       render();
     }
 
+    async function runProbe() {
+      const earliest = earliestRecord();
+      if (state.busy || readOnly || state.demo || !state.account || !earliest) return;
+      state.busy = true;
+      state.probe = null;
+      flash();
+      render();
+      const results = await probeHistory(client, earliest, {
+        onStep: (name) => { state.progress = `正在检查：${name}…`; render(); },
+      });
+      state.probe = { results, verdict: judgeProbe(results, toNum(earliest.timestamp)) };
+      state.busy = false;
+      state.progress = '';
+      render();
+    }
+
+    async function copyProbe() {
+      const text = rootEl.querySelector('textarea') ? rootEl.querySelector('textarea').value : '';
+      try {
+        await navigator.clipboard.writeText(text);
+        flash('ok', '检查结果已复制，可以直接粘贴发出去。');
+      } catch {
+        flash('error', '浏览器不允许自动复制，请展开下面的「原始结果」手动全选复制。');
+      }
+      render();
+    }
+
     function fileStem() {
       const l = state.ledger;
       const d = new Date();
@@ -1294,6 +1437,8 @@ ${pages > 1 ? `<div class="pager">
       if (action === 'page') { state.page = Number(el.dataset.page) || 1; return render(); }
       if (action === 'sync') return void sync();
       if (action === 'sync-blind') return void syncBlind();
+      if (action === 'probe') return void runProbe();
+      if (action === 'copy-probe') return void copyProbe();
       if (action === 'demo') { state.demo = true; state.ledger = sampleLedger(); state.view = 'overview'; flash(); return render(); }
       if (action === 'exit-demo') { state.demo = false; state.ledger = null; state.loaded = false; flash(); return void loadAccount(); }
       if (action === 'export-json') return download(`${fileStem()}.json`, exportJson(state.ledger), 'application/json');
